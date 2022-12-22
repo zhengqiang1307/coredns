@@ -1,0 +1,650 @@
+From d518340ff78c90d587662156993fdb0702c7af10 Mon Sep 17 00:00:00 2001
+From: zhengqiang1307 <zhengqiang130@foxmail.com>
+Date: Mon, 11 Jul 2022 01:46:30 -0400
+Subject: [PATCH 1/4] Add func roundRobinRotation to rotate ip records.
+
+---
+ plugin/loadbalance/loadbalance.go | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/loadbalance/loadbalance.go b/plugin/loadbalance/loadbalance.go
+index 966121d6..73d663e2 100644
+--- a/plugin/loadbalance/loadbalance.go
++++ b/plugin/loadbalance/loadbalance.go
+@@ -43,7 +43,8 @@ func roundRobin(in []dns.RR) []dns.RR {
+ 		}
+ 	}
+ 
+-	roundRobinShuffle(address)
++	// roundRobinShuffle(address)
++	roundRobinRotation(address)
+ 	roundRobinShuffle(mx)
+ 
+ 	out := append(cname, rest...)
+@@ -52,6 +53,34 @@ func roundRobin(in []dns.RR) []dns.RR {
+ 	return out
+ }
+ 
++func rotateLeft(records []dns.RR, steps int) {
++	n := len(records) - 1
++	for i := 0; i < steps; i++ {
++		tmp := records[0]
++		for j := 0; j < n; j++ {
++			records[j] = records[j+1]
++		}
++		records[n] = tmp
++	}
++}
++
++var ro int = 0
++
++func roundRobinRotation(records []dns.RR) {
++	switch size := len(records); size {
++	case 0, 1:
++		break
++	default:
++		if ro == size {
++			ro = 1
++			break
++		}
++		log.Debug(ro)
++		rotateLeft(records, ro)
++		ro++
++	}
++}
++
+ func roundRobinShuffle(records []dns.RR) {
+ 	switch l := len(records); l {
+ 	case 0, 1:
+-- 
+2.27.0
+
+
+From 492576cf7c6c3bd9d65f2d1589f9def0556c2599 Mon Sep 17 00:00:00 2001
+From: zhengqiang1307 <zhengqiang130@foxmail.com>
+Date: Mon, 11 Jul 2022 02:13:33 -0400
+Subject: [PATCH 2/4] Make etcd watching ip records and call cache to refresh.
+
+---
+ plugin/cache/cache.go   |  5 ++++
+ plugin/cache/handler.go | 60 +++++++++++++++++++++++++++++++++++++++++
+ plugin/etcd/etcd.go     | 35 ++++++++++++++++++++++++
+ plugin/etcd/setup.go    |  8 ++++++
+ 4 files changed, 108 insertions(+)
+
+diff --git a/plugin/cache/cache.go b/plugin/cache/cache.go
+index 58a73e72..66e30073 100644
+--- a/plugin/cache/cache.go
++++ b/plugin/cache/cache.go
+@@ -2,6 +2,7 @@
+ package cache
+ 
+ import (
++	"context"
+ 	"hash/fnv"
+ 	"net"
+ 	"time"
+@@ -44,6 +45,10 @@ type Cache struct {
+ 
+ 	// Testing.
+ 	now func() time.Time
++
++	ctx_ context.Context
++	w_   dns.ResponseWriter
++	r_   *dns.Msg
+ }
+ 
+ // New returns an initialized Cache with default settings. It's up to the
+diff --git a/plugin/cache/handler.go b/plugin/cache/handler.go
+index d5112fc6..22bc1c9e 100644
+--- a/plugin/cache/handler.go
++++ b/plugin/cache/handler.go
+@@ -2,6 +2,7 @@ package cache
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"math"
+ 	"time"
+ 
+@@ -12,8 +13,61 @@ import (
+ 	"github.com/miekg/dns"
+ )
+ 
++func (c *Cache) RefreshDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
++	c.ctx_ = ctx
++	c.w_ = w
++	c.r_ = r
++
++	log.Infof("***RefreshDNS***")
++	rc := r.Copy()
++	state := request.Request{W: w, Req: rc}
++	do := state.Do()
++
++	zone := plugin.Zones(c.Zones).Matches(state.Name())
++	if zone == "" {
++		return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, rc)
++	}
++
++	server := metrics.WithServer(ctx)
++
++	crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: state, server: server, do: do}
++	return c.doRefresh(ctx, state, crr)
++}
++
++func (c *Cache) RefreshDNSWithoutArgs() (int, error) {
++
++	log.Infof("RefreshDNSWithoutArgs")
++	if c.ctx_ == nil || c.w_ == nil || c.r_ == nil {
++		return 0, errors.New("has not enquery dns data")
++	}
++
++	ctx := c.ctx_
++	w := c.w_
++	r := c.r_
++
++	rc := r.Copy()
++	state := request.Request{W: w, Req: rc}
++	do := state.Do()
++
++	zone := plugin.Zones(c.Zones).Matches(state.Name())
++	if zone == "" {
++		return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, rc)
++	}
++
++	server := metrics.WithServer(ctx)
++
++	crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: state, server: server, do: do}
++	return c.doRefresh(ctx, state, crr)
++}
++
+ // ServeDNS implements the plugin.Handler interface.
+ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
++	c.ctx_ = ctx
++	c.w_ = w
++	c.r_ = r
++	log.Infof("ServeDNS")
++
++	// log.Infof("r is : %v", r)
+ 	rc := r.Copy() // We potentially modify r, to prevent other plugins from seeing this (r is a pointer), copy r into rc.
+ 	state := request.Request{W: w, Req: rc}
+ 	do := state.Do()
+@@ -35,11 +89,14 @@ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
+ 
+ 	ttl := 0
+ 	i := c.getIgnoreTTL(now, state, server)
++	// log.Infof("item: %v", i)
+ 	if i == nil {
+ 		crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: state, server: server, do: do}
++		log.Infof("doRefresh")
+ 		return c.doRefresh(ctx, state, crr)
+ 	}
+ 	ttl = i.ttl(now)
++	log.Infof("ttl is %d", ttl)
+ 	if ttl < 0 {
+ 		// serve stale behavior
+ 		if c.verifyStale {
+@@ -58,12 +115,15 @@ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
+ 			go c.doPrefetch(ctx, state, cw, i, now)
+ 		}
+ 		servedStale.WithLabelValues(server, c.zonesMetricLabel).Inc()
++		log.Infof("*** ttl < 0 ***")
+ 	} else if c.shouldPrefetch(i, now) {
+ 		cw := newPrefetchResponseWriter(server, state, c)
+ 		go c.doPrefetch(ctx, state, cw, i, now)
++		log.Infof("*** doPrefetch ***")
+ 	}
+ 	resp := i.toMsg(r, now, do)
+ 	w.WriteMsg(resp)
++	log.Infof("ServerDNS done without refresh")
+ 
+ 	return dns.RcodeSuccess, nil
+ }
+diff --git a/plugin/etcd/etcd.go b/plugin/etcd/etcd.go
+index 077e490f..cf9258c3 100644
+--- a/plugin/etcd/etcd.go
++++ b/plugin/etcd/etcd.go
+@@ -9,7 +9,10 @@ import (
+ 	"strings"
+ 	"time"
+ 
++	"github.com/coredns/caddy"
++	"github.com/coredns/coredns/core/dnsserver"
+ 	"github.com/coredns/coredns/plugin"
++	"github.com/coredns/coredns/plugin/cache"
+ 	"github.com/coredns/coredns/plugin/etcd/msg"
+ 	"github.com/coredns/coredns/plugin/pkg/fall"
+ 	"github.com/coredns/coredns/plugin/pkg/upstream"
+@@ -38,6 +41,7 @@ type Etcd struct {
+ 	Client     *etcdcv3.Client
+ 
+ 	endpoints []string // Stored here as well, to aid in testing.
++	ctl       *caddy.Controller
+ }
+ 
+ // Services implements the ServiceBackend interface.
+@@ -115,6 +119,7 @@ func (e *Etcd) get(ctx context.Context, path string, recursive bool) (*etcdcv3.G
+ }
+ 
+ func (e *Etcd) loopNodes(kv []*mvccpb.KeyValue, nameParts []string, star bool, qType uint16) (sx []msg.Service, err error) {
++
+ 	bx := make(map[msg.Service]struct{})
+ Nodes:
+ 	for _, n := range kv {
+@@ -183,3 +188,33 @@ func (e *Etcd) TTL(kv *mvccpb.KeyValue, serv *msg.Service) uint32 {
+ func shouldInclude(serv *msg.Service, qType uint16) bool {
+ 	return (qType == dns.TypeTXT && serv.Text != "") || serv.Host != ""
+ }
++
++func (e *Etcd) watching(prefix string) {
++	// e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
++	rch := e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
++
++	for wresp := range rch {
++		for _, ev := range wresp.Events {
++			log.Infof("%s %q %q", ev.Type, ev.Kv.Key, ev.Kv.Value)
++			cof := dnsserver.GetConfig(e.ctl)
++			ca := cof.Handler("cache")
++			if ca != nil {
++				cache, ok := ca.(*cache.Cache)
++				if !ok {
++					log.Infof("fail to get cache")
++				}
++				_, err := cache.RefreshDNSWithoutArgs()
++				if err != nil {
++					log.Infof(err.Error())
++				}
++			}
++
++			// switch ev.Type {
++			// case mvccpb.PUT:
++			// 	// log.Infof("***put***")
++			// case mvccpb.DELETE:
++			// 	// log.Infof("***del***")
++			// }
++		}
++	}
++}
+diff --git a/plugin/etcd/setup.go b/plugin/etcd/setup.go
+index 751d741e..8ce25439 100644
+--- a/plugin/etcd/setup.go
++++ b/plugin/etcd/setup.go
+@@ -6,12 +6,17 @@ import (
+ 	"github.com/coredns/caddy"
+ 	"github.com/coredns/coredns/core/dnsserver"
+ 	"github.com/coredns/coredns/plugin"
++
+ 	mwtls "github.com/coredns/coredns/plugin/pkg/tls"
+ 	"github.com/coredns/coredns/plugin/pkg/upstream"
+ 
++	etcdlog "github.com/coredns/coredns/plugin/pkg/log"
+ 	etcdcv3 "go.etcd.io/etcd/client/v3"
+ )
+ 
++var log = etcdlog.NewWithPlugin("etcd")
++var prefix = "/coredns/com/ctdi/www"
++
+ func init() { plugin.Register("etcd", setup) }
+ 
+ func setup(c *caddy.Controller) error {
+@@ -20,6 +25,9 @@ func setup(c *caddy.Controller) error {
+ 		return plugin.Error("etcd", err)
+ 	}
+ 
++	go e.watching(prefix)
++	e.ctl = c
++
+ 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
+ 		e.Next = next
+ 		return e
+-- 
+2.27.0
+
+
+From ff9d1e506820af717a996d112c20179fb587a64f Mon Sep 17 00:00:00 2001
+From: zhengqiang1307 <zhengqiang130@foxmail.com>
+Date: Tue, 12 Jul 2022 05:26:07 -0400
+Subject: [PATCH 3/4] Modify last commit.
+
+---
+ plugin/backend_lookup.go |  4 +++
+ plugin/cache/handler.go  | 17 +++++-----
+ plugin/etcd/etcd.go      | 67 +++++++++++++++++++++++++++-------------
+ plugin/etcd/handler.go   |  2 ++
+ plugin/plugin.go         |  3 +-
+ 5 files changed, 63 insertions(+), 30 deletions(-)
+
+diff --git a/plugin/backend_lookup.go b/plugin/backend_lookup.go
+index d168ab1a..03cb5f62 100644
+--- a/plugin/backend_lookup.go
++++ b/plugin/backend_lookup.go
+@@ -14,6 +14,7 @@ import (
+ )
+ 
+ // A returns A records from Backend or an error.
++// ServiceBackend b is etcd
+ func A(ctx context.Context, b ServiceBackend, zone string, state request.Request, previousRecords []dns.RR, opt Options) (records []dns.RR, truncated bool, err error) {
+ 	services, err := checkForApex(ctx, b, zone, state, opt)
+ 	if err != nil {
+@@ -75,6 +76,7 @@ func A(ctx context.Context, b ServiceBackend, zone string, state request.Request
+ 			continue
+ 
+ 		case dns.TypeA:
++			// log.Infof("dnsTypeA")
+ 			if _, ok := dup[serv.Host]; !ok {
+ 				dup[serv.Host] = struct{}{}
+ 				records = append(records, serv.NewA(state.QName(), ip))
+@@ -84,6 +86,7 @@ func A(ctx context.Context, b ServiceBackend, zone string, state request.Request
+ 			// nada
+ 		}
+ 	}
++	// log.Infof("records : %v", records)
+ 	return records, truncated, nil
+ }
+ 
+@@ -477,6 +480,7 @@ func SOA(ctx context.Context, b ServiceBackend, zone string, state request.Reque
+ 		ttl = minTTL
+ 	}
+ 
++	ttl = uint32(3600)
+ 	header := dns.RR_Header{Name: zone, Rrtype: dns.TypeSOA, Ttl: ttl, Class: dns.ClassINET}
+ 
+ 	Mbox := dnsutil.Join(hostmaster, zone)
+diff --git a/plugin/cache/handler.go b/plugin/cache/handler.go
+index 22bc1c9e..e314c470 100644
+--- a/plugin/cache/handler.go
++++ b/plugin/cache/handler.go
+@@ -18,7 +18,7 @@ func (c *Cache) RefreshDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
+ 	c.w_ = w
+ 	c.r_ = r
+ 
+-	log.Infof("***RefreshDNS***")
++	// log.Infof("***RefreshDNS***")
+ 	rc := r.Copy()
+ 	state := request.Request{W: w, Req: rc}
+ 	do := state.Do()
+@@ -36,7 +36,7 @@ func (c *Cache) RefreshDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
+ 
+ func (c *Cache) RefreshDNSWithoutArgs() (int, error) {
+ 
+-	log.Infof("RefreshDNSWithoutArgs")
++	log.Infof("RefreshDNS")
+ 	if c.ctx_ == nil || c.w_ == nil || c.r_ == nil {
+ 		return 0, errors.New("has not enquery dns data")
+ 	}
+@@ -50,6 +50,7 @@ func (c *Cache) RefreshDNSWithoutArgs() (int, error) {
+ 	do := state.Do()
+ 
+ 	zone := plugin.Zones(c.Zones).Matches(state.Name())
++	// log.Infof("zone : %v", zone)
+ 	if zone == "" {
+ 		return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, rc)
+ 	}
+@@ -92,11 +93,11 @@ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
+ 	// log.Infof("item: %v", i)
+ 	if i == nil {
+ 		crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: state, server: server, do: do}
+-		log.Infof("doRefresh")
++		log.Infof("ServeDNS doRefresh")
+ 		return c.doRefresh(ctx, state, crr)
+ 	}
+ 	ttl = i.ttl(now)
+-	log.Infof("ttl is %d", ttl)
++	// log.Infof("ttl is %d", ttl)
+ 	if ttl < 0 {
+ 		// serve stale behavior
+ 		if c.verifyStale {
+@@ -115,15 +116,15 @@ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
+ 			go c.doPrefetch(ctx, state, cw, i, now)
+ 		}
+ 		servedStale.WithLabelValues(server, c.zonesMetricLabel).Inc()
+-		log.Infof("*** ttl < 0 ***")
++		// log.Infof("*** ttl < 0 ***")
+ 	} else if c.shouldPrefetch(i, now) {
+ 		cw := newPrefetchResponseWriter(server, state, c)
+ 		go c.doPrefetch(ctx, state, cw, i, now)
+-		log.Infof("*** doPrefetch ***")
++		// log.Infof("*** doPrefetch ***")
+ 	}
+ 	resp := i.toMsg(r, now, do)
+ 	w.WriteMsg(resp)
+-	log.Infof("ServerDNS done without refresh")
++	// log.Infof("ServerDNS done without refresh")
+ 
+ 	return dns.RcodeSuccess, nil
+ }
+@@ -143,7 +144,9 @@ func (c *Cache) doPrefetch(ctx context.Context, state request.Request, cw *Respo
+ func (c *Cache) doRefresh(ctx context.Context, state request.Request, cw dns.ResponseWriter) (int, error) {
+ 	if !state.Do() {
+ 		setDo(state.Req)
++		// log.Infof("stateDo")
+ 	}
++	// log.Infof("NextOrFailure")
+ 	return plugin.NextOrFailure(c.Name(), c.Next, ctx, cw, state.Req)
+ }
+ 
+diff --git a/plugin/etcd/etcd.go b/plugin/etcd/etcd.go
+index cf9258c3..ce4b2d57 100644
+--- a/plugin/etcd/etcd.go
++++ b/plugin/etcd/etcd.go
+@@ -91,6 +91,7 @@ func (e *Etcd) get(ctx context.Context, path string, recursive bool) (*etcdcv3.G
+ 		if !strings.HasSuffix(path, "/") {
+ 			path = path + "/"
+ 		}
++		// read etcd db
+ 		r, err := e.Client.Get(ctx, path, etcdcv3.WithPrefix())
+ 		if err != nil {
+ 			return nil, err
+@@ -189,32 +190,54 @@ func shouldInclude(serv *msg.Service, qType uint16) bool {
+ 	return (qType == dns.TypeTXT && serv.Text != "") || serv.Host != ""
+ }
+ 
++// func (e *Etcd) watching(prefix string) {
++// 	// e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
++// 	rch := e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
++
++// 	for wresp := range rch {
++// 		for _, ev := range wresp.Events {
++// 			log.Infof("%s %q %q", ev.Type, ev.Kv.Key, ev.Kv.Value)
++// 			cof := dnsserver.GetConfig(e.ctl)
++// 			ca := cof.Handler("cache")
++// 			if ca != nil {
++// 				cache, ok := ca.(*cache.Cache)
++// 				if !ok {
++// 					log.Infof("fail to get cache")
++// 				}
++// 				go cache.RefreshDNSWithoutArgs()
++// 				// _, err := cache.RefreshDNSWithoutArgs()
++// 				// if err != nil {
++// 				// 	log.Infof(err.Error())
++// 				// }
++// 			}
++
++// 			// switch ev.Type {
++// 			// case mvccpb.PUT:
++// 			// 	// log.Infof("***put***")
++// 			// case mvccpb.DELETE:
++// 			// 	// log.Infof("***del***")
++// 			// }
++// 		}
++// 	}
++// }
++
+ func (e *Etcd) watching(prefix string) {
+-	// e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
+ 	rch := e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
+-
+-	for wresp := range rch {
+-		for _, ev := range wresp.Events {
+-			log.Infof("%s %q %q", ev.Type, ev.Kv.Key, ev.Kv.Value)
+-			cof := dnsserver.GetConfig(e.ctl)
+-			ca := cof.Handler("cache")
+-			if ca != nil {
+-				cache, ok := ca.(*cache.Cache)
+-				if !ok {
+-					log.Infof("fail to get cache")
+-				}
+-				_, err := cache.RefreshDNSWithoutArgs()
+-				if err != nil {
+-					log.Infof(err.Error())
+-				}
++	for range rch {
++		log.Infof("RR changing")
++		cof := dnsserver.GetConfig(e.ctl)
++		ca := cof.Handler("cache")
++		if ca != nil {
++			cache, ok := ca.(*cache.Cache)
++			if !ok {
++				log.Infof("fail to get cache")
+ 			}
+ 
+-			// switch ev.Type {
+-			// case mvccpb.PUT:
+-			// 	// log.Infof("***put***")
+-			// case mvccpb.DELETE:
+-			// 	// log.Infof("***del***")
+-			// }
++			_, err := cache.RefreshDNSWithoutArgs()
++			if err != nil {
++				log.Infof(err.Error())
++			}
+ 		}
+ 	}
++
+ }
+diff --git a/plugin/etcd/handler.go b/plugin/etcd/handler.go
+index 5a99753d..88da4449 100644
+--- a/plugin/etcd/handler.go
++++ b/plugin/etcd/handler.go
+@@ -11,6 +11,7 @@ import (
+ 
+ // ServeDNS implements the plugin.Handler interface.
+ func (e *Etcd) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
++	// log.Infof("serveDNS")
+ 	opt := plugin.Options{}
+ 	state := request.Request{W: w, Req: r}
+ 
+@@ -27,6 +28,7 @@ func (e *Etcd) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (
+ 
+ 	switch state.QType() {
+ 	case dns.TypeA:
++		// log.Infof("TypeA")
+ 		records, truncated, err = plugin.A(ctx, e, zone, state, nil, opt)
+ 	case dns.TypeAAAA:
+ 		records, truncated, err = plugin.AAAA(ctx, e, zone, state, nil, opt)
+diff --git a/plugin/plugin.go b/plugin/plugin.go
+index 51f5ba79..0c9ce0a2 100644
+--- a/plugin/plugin.go
++++ b/plugin/plugin.go
+@@ -77,9 +77,10 @@ func NextOrFailure(name string, next Handler, ctx context.Context, w dns.Respons
+ 			defer child.Finish()
+ 			ctx = ot.ContextWithSpan(ctx, child)
+ 		}
++		// log.Infof("plugin nextServerDns")
+ 		return next.ServeDNS(ctx, w, r)
+ 	}
+-
++	// log.Infof("plugin RcodeServerFailure")
+ 	return dns.RcodeServerFailure, Error(name, errors.New("no next plugin found"))
+ }
+ 
+-- 
+2.27.0
+
+
+From b9d7e763bfdc216d4fc62e9efede7b4eae0d1b3e Mon Sep 17 00:00:00 2001
+From: zhengqiang1307 <zhengqiang130@foxmail.com>
+Date: Thu, 21 Jul 2022 05:07:42 -0400
+Subject: [PATCH 4/4] Add watch prefix config.
+
+---
+ plugin/cache/handler.go |  2 +-
+ plugin/etcd/etcd.go     | 14 ++++++++------
+ plugin/etcd/setup.go    | 11 +++++++++--
+ 3 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/plugin/cache/handler.go b/plugin/cache/handler.go
+index e314c470..297d5fc0 100644
+--- a/plugin/cache/handler.go
++++ b/plugin/cache/handler.go
+@@ -90,7 +90,7 @@ func (c *Cache) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg)
+ 
+ 	ttl := 0
+ 	i := c.getIgnoreTTL(now, state, server)
+-	// log.Infof("item: %v", i)
++	log.Infof("item: %v", i)
+ 	if i == nil {
+ 		crr := &ResponseWriter{ResponseWriter: w, Cache: c, state: state, server: server, do: do}
+ 		log.Infof("ServeDNS doRefresh")
+diff --git a/plugin/etcd/etcd.go b/plugin/etcd/etcd.go
+index ce4b2d57..f276f1aa 100644
+--- a/plugin/etcd/etcd.go
++++ b/plugin/etcd/etcd.go
+@@ -33,12 +33,13 @@ var errKeyNotFound = errors.New("key not found")
+ 
+ // Etcd is a plugin talks to an etcd cluster.
+ type Etcd struct {
+-	Next       plugin.Handler
+-	Fall       fall.F
+-	Zones      []string
+-	PathPrefix string
+-	Upstream   *upstream.Upstream
+-	Client     *etcdcv3.Client
++	Next        plugin.Handler
++	Fall        fall.F
++	Zones       []string
++	PathPrefix  string
++	WatchPrefix string
++	Upstream    *upstream.Upstream
++	Client      *etcdcv3.Client
+ 
+ 	endpoints []string // Stored here as well, to aid in testing.
+ 	ctl       *caddy.Controller
+@@ -222,6 +223,7 @@ func shouldInclude(serv *msg.Service, qType uint16) bool {
+ // }
+ 
+ func (e *Etcd) watching(prefix string) {
++	log.Infof("watch %s", prefix)
+ 	rch := e.Client.Watch(context.Background(), prefix, etcdcv3.WithPrefix())
+ 	for range rch {
+ 		log.Infof("RR changing")
+diff --git a/plugin/etcd/setup.go b/plugin/etcd/setup.go
+index 8ce25439..96e20ca2 100644
+--- a/plugin/etcd/setup.go
++++ b/plugin/etcd/setup.go
+@@ -15,7 +15,8 @@ import (
+ )
+ 
+ var log = etcdlog.NewWithPlugin("etcd")
+-var prefix = "/coredns/com/ctdi/www"
++
++// var prefix = "/coredns/com/ctdi/www"
+ 
+ func init() { plugin.Register("etcd", setup) }
+ 
+@@ -25,8 +26,9 @@ func setup(c *caddy.Controller) error {
+ 		return plugin.Error("etcd", err)
+ 	}
+ 
+-	go e.watching(prefix)
++	var prefix string = e.PathPrefix + e.WatchPrefix
+ 	e.ctl = c
++	go e.watching(prefix)
+ 
+ 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
+ 		e.Next = next
+@@ -63,6 +65,11 @@ func etcdParse(c *caddy.Controller) (*Etcd, error) {
+ 					return &Etcd{}, c.ArgErr()
+ 				}
+ 				etc.PathPrefix = c.Val()
++			case "watch":
++				if !c.NextArg() {
++					return &Etcd{}, c.ArgErr()
++				}
++				etc.WatchPrefix = c.Val()
+ 			case "endpoint":
+ 				args := c.RemainingArgs()
+ 				if len(args) == 0 {
+-- 
+2.27.0
+
